@@ -51,28 +51,66 @@ func Users(ctx context.Context) ([]string, error) {
 
 func GroupUsers(ctx context.Context, group string) ([]string, error) {
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "dscl", ".", "list", "/Groups/"+group, "GroupMembership")
+	cmd := exec.CommandContext(ctx, "dscl", ".", "-read", "/Groups/"+group, "GroupMembership")
 	cmd.Stderr = &stderr
 	slog.DebugContext(ctx, "Running command", "cmd", cmd.Args)
 	b, err := cmd.Output()
 	if err != nil {
+		if strings.Contains(stderr.String(), "eDSRecordNotFound") {
+			// The group does not exist yet: no members.
+			return nil, nil
+		}
 		return nil, fmt.Errorf("failed to run %v: %w (stderr=%q)", cmd.Args, err, stderr.String())
 	}
+	return parseGroupMembership(b), nil
+}
 
-	lines := strings.Split(string(b), "\n")
+// parseGroupMembership parses `dscl . -read /Groups/<g> GroupMembership` output.
+//
+// dscl(1) prints "No such key: GroupMembership" (exit 0) when the group exists
+// but has no members attribute. Otherwise it prints "GroupMembership:" followed
+// by a space-separated value list on the same line, or, per dscl(1), one value
+// per indented line when a value contains an embedded space.
+func parseGroupMembership(out []byte) []string {
+	lines := strings.Split(string(out), "\n")
 	var res []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	for i := 0; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" || strings.HasPrefix(trimmed, "No such key:") {
 			continue
 		}
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) >= 2 && parts[0] == "GroupMembership:" {
-			users := strings.Fields(parts[1])
-			res = append(res, users...)
+		rest, ok := strings.CutPrefix(trimmed, "GroupMembership:")
+		if !ok {
+			continue
+		}
+		if rest = strings.TrimSpace(rest); rest != "" {
+			res = append(res, strings.Fields(rest)...)
+			continue
+		}
+		for i+1 < len(lines) && strings.HasPrefix(lines[i+1], " ") {
+			i++
+			if v := strings.TrimSpace(lines[i]); v != "" {
+				res = append(res, v)
+			}
 		}
 	}
-	return res, nil
+	return res
+}
+
+// groupExists reports whether /Groups/<groupName> exists in the local
+// directory service.
+func groupExists(ctx context.Context, groupName string) (bool, error) {
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "dscl", ".", "-read", "/Groups/"+groupName)
+	cmd.Stderr = &stderr
+	slog.DebugContext(ctx, "Running command", "cmd", cmd.Args)
+	if err := cmd.Run(); err != nil {
+		if strings.Contains(stderr.String(), "eDSRecordNotFound") {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to run %v: %w (stderr=%q)", cmd.Args, err, stderr.String())
+	}
+	return true, nil
 }
 
 func ReadAttribute(ctx context.Context, username string, k Attribute) (string, error) {
@@ -139,8 +177,22 @@ func DeleteUserCmds(ctx context.Context, instUser string, opts DeleteOpts) ([]*e
 }
 
 func GroupSetupCmds(ctx context.Context, instUser, groupName string) ([]*exec.Cmd, error) {
-	var cmds []*exec.Cmd
+	var exists bool
+	if groupName != "" {
+		var err error
+		if exists, err = groupExists(ctx, groupName); err != nil {
+			return nil, err
+		}
+	}
+	return groupSetupCmds(ctx, instUser, groupName, exists)
+}
 
+// groupSetupCmds builds the command list for GroupSetupCmds.
+// groupAlreadyExists says whether /Groups/<groupName> already exists, so the
+// -create command is included only when it is needed. Every command that
+// carries groupName passes it as a direct argument, never inside a shell
+// string.
+func groupSetupCmds(ctx context.Context, instUser, groupName string, groupAlreadyExists bool) ([]*exec.Cmd, error) {
 	sudoersContent, err := sudo.Sudoers(instUser)
 	if err != nil {
 		return nil, err
@@ -150,16 +202,17 @@ func GroupSetupCmds(ctx context.Context, instUser, groupName string) ([]*exec.Cm
 		return nil, err
 	}
 
-	cmds = append(cmds,
+	cmds := []*exec.Cmd{
 		exec.CommandContext(ctx, "sudo", "chmod", "go-rx", filepath.Join("/Users", instUser)),
 		exec.CommandContext(ctx, "sudo", "sh", "-c", fmt.Sprintf("mkdir -p /etc/sudoers.d && echo '%s' >'%s' && chmod 440 '%s'", sudoersContent, sudoersPath, sudoersPath)),
-	)
+	}
 
 	if groupName != "" {
-		cmds = append(cmds,
-			exec.CommandContext(ctx, "sudo", "sh", "-c", fmt.Sprintf("dscl . -create /Groups/%s 2>/dev/null || true", groupName)),
-			exec.CommandContext(ctx, "sudo", "sh", "-c", fmt.Sprintf("dscl . -append /Groups/%s GroupMembership %s", groupName, instUser)),
-		)
+		if !groupAlreadyExists {
+			cmds = append(cmds, exec.CommandContext(ctx, "sudo", "dscl", ".", "-create", "/Groups/"+groupName))
+		}
+		// -merge only adds the value if it is not already present, so a repeat call is a no-op.
+		cmds = append(cmds, exec.CommandContext(ctx, "sudo", "dscl", ".", "-merge", "/Groups/"+groupName, "GroupMembership", instUser))
 	}
 
 	return cmds, nil
